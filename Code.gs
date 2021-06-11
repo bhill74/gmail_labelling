@@ -1,73 +1,17 @@
 //************************************************************
-//%NAME: MyLogger
-//%DESCRIPTION:
-// Collects all the messages output to the log and just in case
-// they need to be sent to the user.
-//************************************************************
-function MyLogger(title) {
-  this.log = "";
-  this.title = title;
-  
-  this.add = function(msg) {
-    Logger.log(msg);
-    this.log += msg + "\n";
-  }
-  
-  this.send = function() {
-    GmailApp.sendEmail(Session.getActiveUser().getEmail(), this.title, this.log);
-  }
-};
-
-//************************************************************
-//%NAME: filterAll
-//%DESCRIPTION:
-// Processes all the threads in the INBOX by default omitting
-// those that are already tagged.
-//************************************************************
-function filterAll() {
-  filterThreads({ "limit": "all",
-                  "untagged": true,
-                  "report": false});
-}
-
-//************************************************************
-//%NAME: filterNew
-//%DESCRIPTION:
-// Processes all the threads in the INBOX by default omitting
-// those that are already tagged, when a thread with labels is
-// encountered then stop.
-//************************************************************
-function filterNew() {
-  filterThreads({ "limit": "all",
-                  "untagged": true,
-                  "stopAt": "firstLabelled",
-                  "report": false});
-}
-
-//************************************************************
-//%NAME: filterAllAndReport
-//%DESCRIPTION:
-// Processes all the threads in the INBOX by default omitting
-// those that are already tagged and sends a follow up report.
-//************************************************************
-function filterAllAndReport() {
-  filterThreads({ "limit": "all",
-                  "untagged": true,
-                  "report": true});
-}
-
-//************************************************************
 //%NAME: filterThreads
 //%DESCRIPTION:
 // Process all desired Inbox threads based on the given settings.
 //************************************************************
 function filterThreads(settings) {
-  logger = new MyLogger("Labelling Emails");
+  logger = new MyLogger.create("Labelling Emails");
   
-  var filters = getFilters(logger);
-  for(filter in filters) {
-    info = filters[filter];
+  var folder = "DynamicLabels";
+  if ("folder" in settings) {
+    folder = settings.folder
   }
+  
+  var filters = MailFilters.get(folder);
   
   processInbox(settings, filters, logger);
   
@@ -90,7 +34,7 @@ function processInbox(settings, filters, logger) {
     if (settings["untagged"] === true) {
       if (thread.getLabels().length > 0) {
         if (settings["stopAt"] === "firstLabelled") {
-          logger.add("   found labelled");
+          logger.add("   found labelled thread, stopping");
           break;
         }
         logger.add("  skipping");
@@ -98,9 +42,9 @@ function processInbox(settings, filters, logger) {
       }
     }
     
-    processThread(thread, filters, logger);
+    processThread(thread, filters, settings, logger);
   }
-} 
+}
 
 //************************************************************
 //%NAME: getThreads
@@ -130,12 +74,12 @@ function getThreads(settings) {
 // Description: Process the given thread against the whole
 // collection of filters.
 //************************************************************
-function processThread(thread, filters, logger) {
+function processThread(thread, filters, settings, logger) {
   var content = {};
   
-  for(tag in filters) {
-    var filter = filters[tag];
-    logger.add("  Filter: " + tag);
+  for(var i in filters) {
+    var filter = filters[i];
+    logger.add("  Filter: " + filter["name"]);
     if (!("label" in filter)) {
       logger.add("   no label");
       continue
@@ -147,7 +91,8 @@ function processThread(thread, filters, logger) {
     }
     
     var patterns = filter["patterns"];
-      
+    
+    var labelNames = null;
     for (type in patterns) {
      if (!(type in content)) {
         content[type] = getContent(thread, type);
@@ -158,19 +103,45 @@ function processThread(thread, filters, logger) {
         continue;
       }
       
-      logger.add("   " + type + ": " + patterns[type].toString());
+      logger.add("   " + type + ": " + patterns[type].toString() + " --> " + content[type].split("\n")[0]);
+      var result = matchPattern(content[type], patterns[type], filter["label"], logger);
+      logger.add("   Result " + (result === true ? "TRUE" : result.join(", ")));
       
-      var labelName = extractLabelFromPattern(content[type], patterns[type], filter["label"]);
-      if (labelName) {
-        logger.add("     Applying '" + labelName + "'");
-        applyLabel(thread, labelName);
-        if (filter["archive"] === true) {
-          thread.moveToArchive();
+      if (result === true) {
+        continue;
+      } else if (result !== false && result.length > 0) {
+        if (labelNames) {
+          labelNames = labelNames.filter(function(v) { return result.includes(v) });
         } else {
-          thread.moveToInbox();
+          labelNames = result;
         }
+      } else {
+        labelNames = [];
         break;
       }
+    }
+    
+    if (labelNames == null) {
+      continue;
+    }
+    
+    logger.add("   Labels " + labelNames.join(", "));
+    
+    for(var i in labelNames) {
+      var labelName = labelNames[i];
+      logger.add("     Applying '" + labelName + "'");
+      
+      if (settings["modifyThreads"] === false) {
+        continue;
+      }
+      
+      applyLabel(thread, labelName);
+      if (filter["archive"] === true) {
+        thread.moveToArchive();
+      } else {
+        thread.moveToInbox();
+      }
+      break;
     }
   }
 }     
@@ -201,26 +172,64 @@ function getContent(thread, type) {
   return;
 }
 
+String.prototype.matchAll = function(re) {
+  var str = this;
+  var result = [];
+  var post = /([^\0]*)$/;
+  var flags = '';
+  if (re.ignoreCase || post.ignoreCase) flags += 'i';
+  if (re.global || post.global) flags += 'g';
+  re = new RegExp(re.source + post.source, flags);
+  var result = [];
+  var m = str.match(re);
+  while(m !== null) {
+    var remainder = m.pop();
+    var p = m[0].length - remainder.length;
+    m[0] = m[0].substring(0, p);
+    result.push(m);
+    str = remainder;
+    m = str.match(re);
+  }
+  return result;
+}
+
 //************************************************************
-// Function: extractLabelFromPattern()
+// Function: matchPattern()
 // Description: Match a pattern against the given content and
 // build the related label. If there is no match then return no
 // label.
 //************************************************************
-function extractLabelFromPattern(content, pattern, label) {
-  var match = content.match(pattern);
-  if (!match) {
-    Logger.log("no match");
-    return;
+function matchPattern(content, pattern, label, logger) {
+  var result = [];
+  var isDynamic = label.match(/\\\d+/) ? true : false;
+  
+  var matches = content.matchAll(pattern);
+  for (var i in matches) {
+    var match = matches[i];
+  
+    if (match.length == 1) {
+      return (isDynamic === true) ? true : [label];
+    }
+    
+    if (isDynamic === false) {
+      return [label];
+    }
+    
+    var newLabel = label;
+    for(var i = 1; i < match.length; i++) {
+      newLabel = newLabel.replace("\\"+i.toString(10), match[i]);
+    }  
+    
+    if (result.indexOf(newLabel) === -1) {
+       result.push(newLabel);
+    }
   }
   
-  Logger.log(match);
-  
-  for(var i = 1; i < match.length; i++) {
-    label = label.replace("\\"+i.toString(10), match[i]);
+  if (result.length == 0) {
+    logger.add("  -- not matched -- ");
   }
   
-  return label;
+  return result;
 }  
 
 //************************************************************
@@ -249,52 +258,4 @@ function applyLabel(thread, name) {
   }
   
   label.addToThread(thread);
-}
-
-//************************************************************
-// Function: getFiltersJSON()
-// Description: Retrieves the configuration settings based on
-// from a specific file in Google Drive.
-//************************************************************
-function getFiltersJSON() {
-  var files = DriveApp.getFilesByName("filtering.json");
-  while (files.hasNext()) {
-    var file = files.next();
-    var blob = file.getBlob();
-    var content = blob.getDataAsString();
-    return content;
-  }
-  
-  logger.add("No settings file could be found");
-}
-
-//************************************************************
-// Function: getFilters()
-// Description: Retrieves the configuration settings based on
-// from a specific file in Google Drive and parses them based
-// on JSON.
-//************************************************************
-function getFilters(logger) {
-  var filters = getFiltersJSON(logger);
-  filters = JSON.parse(filters);
-  for(filter in filters) {
-    info = filters[filter];
-    if ("patterns" in info) {
-      patterns = info["patterns"];
-      for(type in patterns) {
-        var pattern = patterns[type];
-        if (typeof pattern === 'string') {
-          patterns[type] = new RegExp(pattern);
-        } else if (Array.isArray(pattern)) {
-          if (pattern.length == 1) {
-            patterns[type] = new RegExp(pattern[0]);
-          } else if (pattern.length == 2) {
-            patterns[type] = new RegExp(pattern[0], pattern[1]);
-          }
-        }
-      }
-    }
-  }
-  
-  return filters;
 }
